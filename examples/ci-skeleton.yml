@@ -1,0 +1,101 @@
+# A sanitised skeleton of the pipeline described in the README. GitLab CI
+# syntax, but the idea carries to any CI that can issue OIDC tokens.
+#
+# Fill in every value marked <...> in CI variables or in your own copy. Do not
+# commit real account ids, role names or bucket names to a public repo.
+
+stages: [test, deploy, after-deploy]
+
+.npm-cache: &npm-cache
+  key: { prefix: npm, files: [package-lock.json] }
+  paths: [.npm/]
+  policy: pull
+
+# On every merge request: checks, then a build. Not on main, where the deploy
+# builds the same thing.
+verify:
+  stage: test
+  image: node:22
+  cache: { <<: *npm-cache, policy: pull-push }
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run test                  # includes the tests that prove each check can fail
+    - npm run index                 # regenerate menu, statistics, help data
+    - git diff --exit-code -- <generated files>   # fails if someone forgot to regenerate
+    - node scripts/check-links.mjs  # also reads href on MDX components
+    - npm run build
+    - npm run validate
+    - npx blume doctor
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# A private preview per merge request. Not the production host.
+pages:
+  stage: deploy
+  image: node:22
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run build
+    - rm -rf public && mv dist public
+  artifacts: { paths: [public] }
+  pages: { path_prefix: "mr-$CI_MERGE_REQUEST_IID", expire_in: "1 week" }
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+build-production:
+  stage: test
+  image: node:22
+  variables:
+    DOCS_SITE_URL: "https://docs.example.com"   # baked into canonical links, llms.txt, OG tags
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm run build
+    - echo "$CI_COMMIT_SHA" > dist/version.txt   # the post deploy check waits for this
+  artifacts: { paths: [dist] }
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy:
+  stage: deploy
+  image: { name: amazon/aws-cli, entrypoint: [""] }
+  needs: [{ job: build-production, artifacts: true }]
+  # One deploy at a time. Also set the resource group to "oldest first" through
+  # the API once, otherwise an older pipeline can finish last and roll the site back.
+  resource_group: docs-production
+  id_tokens:
+    CI_OIDC_TOKEN: { aud: "<audience your cloud trust policy expects>" }
+  variables:
+    AWS_DEFAULT_REGION: "<region>"
+    # AWS_ROLE_ARN, DOCS_BUCKET and CDN_DISTRIBUTION_ID are CI variables.
+  script:
+    - >
+      creds=$(aws sts assume-role-with-web-identity
+      --role-arn "$AWS_ROLE_ARN" --role-session-name "ci-$CI_PIPELINE_ID"
+      --web-identity-token "$CI_OIDC_TOKEN" --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $creds)
+    # Upload in disjoint parts so each file goes up once, with the right type.
+    # 1. Hashed assets and screenshots: size only. Their names change when content does.
+    - aws s3 sync dist/ "s3://$DOCS_BUCKET/" --size-only --exclude "*" --include "_astro/*" --include "images/*"
+    # 2. Markdown mirrors with an explicit type (the CLI's table does not know .md).
+    - aws s3 sync dist/ "s3://$DOCS_BUCKET/" --delete --exclude "*" --include "*.md" --include "*.mdx" --content-type "text/markdown; charset=utf-8"
+    # 3. Everything else. A fixed typo can keep the size, so compare size and time.
+    - aws s3 sync dist/ "s3://$DOCS_BUCKET/" --delete --exclude "_astro/*" --exclude "images/*" --exclude "*.md" --exclude "*.mdx"
+    - aws cloudfront create-invalidation --distribution-id "$CDN_DISTRIBUTION_ID" --paths "/*"
+    # Add a check (a script in the repo) that every built file falls in exactly
+    # one of these parts. Then a new file type cannot go up unfiltered.
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# Check the live site, not dist/. Header, content types, a real 404 depend on
+# the CDN and the bucket, not on your build.
+check-live-site:
+  stage: after-deploy
+  image: node:22
+  needs: [deploy]
+  script:
+    # Waits until version.txt shows this commit, or a newer commit that contains
+    # it (two merges close together). Ask git, do not compare strings.
+    - node scripts/check-after-deploy.mjs https://docs.example.com "$CI_COMMIT_SHA"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
